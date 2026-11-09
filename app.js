@@ -78,15 +78,6 @@ async function idbDelete(store, key) {
     r.onerror = () => rej(r.error);
   });
 }
-async function idbClear(store) {
-  const db = await dbPromise;
-  return new Promise((res, rej) => {
-    const tx = db.transaction(store, "readwrite");
-    const r = tx.objectStore(store).clear();
-    r.onsuccess = () => res();
-    r.onerror = () => rej(r.error);
-  });
-}
 
 const dbPromise = openDB();
 
@@ -115,13 +106,19 @@ async function decryptBuf(key, iv, data) {
 const enc = new TextEncoder();
 
 /* ── State ────────────────────────────────────────────────── */
+const SORTS = [
+  ["newest", "Newest"],
+  ["oldest", "Oldest"],
+  ["name", "A–Z"],
+  ["favorites", "Favorites"],
+];
 const state = {
-  items: [],          // in-memory plain records (only while unlocked)
-  key: null,          // CryptoKey when vault is encrypted & unlocked
+  items: [],
+  key: null,
   cfg: { encrypted: false },
   query: "",
   sort: "newest",
-  urls: new Map(),    // id -> { thumb, full }
+  urls: new Map(),
   lightboxId: null,
   locked: true,
 };
@@ -168,7 +165,7 @@ function thumbURL(rec) {
   return u.thumb;
 }
 function fullURL(rec) {
-  thumbURL(rec); // ensure both
+  thumbURL(rec);
   return state.urls.get(rec.id).full;
 }
 function dropURLs(id) {
@@ -225,7 +222,6 @@ function makeThumb(bitmap, maxEdge = 560) {
     canvas.toBlob(
       (b) => {
         if (b && b.type === "image/webp") return res(b);
-        // Encoder without WebP support — fall back to JPEG on a dark base
         const c2 = document.createElement("canvas");
         c2.width = w; c2.height = h;
         const ctx2 = c2.getContext("2d");
@@ -276,7 +272,7 @@ async function addFiles(fileList) {
   }
   if (added.length) {
     render();
-    toast(added.length === 1 ? "1 artifact added to the vault" : added.length + " artifacts added to the vault");
+    toast(added.length === 1 ? "Added to the vault" : added.length + " added to the vault");
   }
 }
 
@@ -305,16 +301,15 @@ function render() {
   const bytes = items.reduce((s, r) => s + (r.size || 0), 0);
 
   $("#artifactCount").textContent = total
-    ? total + (total === 1 ? " artifact" : " artifacts") + (favs ? " · " + favs + (favs === 1 ? " favorite" : " favorites") : "")
+    ? total + (total === 1 ? " artifact" : " artifacts") + (favs ? " · " + favs + " ★" : "") + " · " + fmtBytes(bytes)
     : "";
-
-  $("#storageStats").textContent = total ? fmtBytes(bytes) + " stored locally" : "";
 
   const vis = visibleItems();
   const empty = total === 0;
   $("#emptyState").hidden = !empty;
   $("#gridSection").hidden = empty;
   $("#noResults").hidden = !(empty === false && vis.length === 0);
+  $("#fab").hidden = empty;
 
   const grid = $("#grid");
   grid.innerHTML = "";
@@ -330,27 +325,92 @@ function render() {
       '<span class="cell-fav' + (rec.favorite ? " active filled" : "") + '" aria-hidden="true">' +
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8l2.5 5.2 5.7.8-4.1 4 1 5.6L12 16.7l-5.1 2.7 1-5.6-4.1-4 5.7-.8L12 3.8z"/></svg></span>' +
       '<span class="cell-caption' + (rec.caption ? " has-caption" : "") + '">' + chips + cap + "</span>";
-    cell.addEventListener("click", () => openLightbox(rec.id));
+    cell.addEventListener("click", () => openLightbox(rec.id, cell));
     grid.appendChild(cell);
   });
+}
+
+/* ── 2.5D tilt ────────────────────────────────────────────── */
+function wireTilt() {
+  const grid = $("#grid");
+  let active = null;
+  const reset = () => {
+    if (!active) return;
+    active.style.setProperty("--rx", "0deg");
+    active.style.setProperty("--ry", "0deg");
+    active.style.setProperty("--tz", "0px");
+    active = null;
+  };
+  grid.addEventListener("pointermove", (e) => {
+    if (e.pointerType === "touch") return;
+    const cell = e.target.closest(".cell");
+    if (cell !== active) reset();
+    if (!cell) return;
+    active = cell;
+    const r = cell.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width - 0.5;
+    const py = (e.clientY - r.top) / r.height - 0.5;
+    cell.style.setProperty("--rx", (-py * 10).toFixed(2) + "deg");
+    cell.style.setProperty("--ry", (px * 12).toFixed(2) + "deg");
+    cell.style.setProperty("--tz", "14px");
+  }, { passive: true });
+  grid.addEventListener("pointerleave", reset);
+}
+
+/* ── HUD auto-hide ────────────────────────────────────────── */
+let idleTimer = null;
+function pokeIdle() {
+  document.body.classList.remove("idle");
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+    const modalOpen = !$("#securityModal").hidden || !$("#confirmModal").hidden;
+    if (!typing && !modalOpen) document.body.classList.add("idle");
+  }, 2600);
 }
 
 /* ── Lightbox ─────────────────────────────────────────────── */
 function lbList() { return visibleItems(); }
 function currentRec() { return state.items.find((r) => r.id === state.lightboxId); }
 
-function openLightbox(id) {
+function openLightbox(id, fromCell) {
   state.lightboxId = id;
   const rec = currentRec();
   if (!rec) return;
-  const lb = $("#lightbox");
-  lb.hidden = false;
+  $("#lightbox").hidden = false;
+  document.body.classList.add("lb-open");
   document.body.style.overflow = "hidden";
   updateLightbox();
+  pokeIdle();
+
+  /* FLIP — the image flies out of the grid cell into the center */
+  if (fromCell) {
+    const img = $("#lbImage");
+    const fromImg = fromCell.querySelector("img");
+    (async () => {
+      try { await img.decode(); } catch (_) { /* already decoded */ }
+      requestAnimationFrame(() => {
+        if (!fromImg.isConnected) return;
+        const from = fromImg.getBoundingClientRect();
+        const to = img.getBoundingClientRect();
+        if (!to.width || !to.height) return;
+        const dx = from.left + from.width / 2 - (to.left + to.width / 2);
+        const dy = from.top + from.height / 2 - (to.top + to.height / 2);
+        const sx = from.width / to.width;
+        const sy = from.height / to.height;
+        img.style.transition = "none";
+        img.style.transform = "translate(" + dx.toFixed(1) + "px, " + dy.toFixed(1) + "px) scale(" + sx.toFixed(4) + ", " + sy.toFixed(4) + ")";
+        img.getBoundingClientRect(); // force reflow
+        img.style.transition = "";
+        img.style.transform = "";
+      });
+    })();
+  }
 }
 function closeLightbox() {
   state.lightboxId = null;
   $("#lightbox").hidden = true;
+  document.body.classList.remove("lb-open");
   document.body.style.overflow = "";
 }
 function stepLightbox(dir) {
@@ -432,7 +492,11 @@ async function tryUnlock(pass) {
     const plain = await decryptBuf(key, new Uint8Array(state.cfg.verifier.iv), state.cfg.verifier.data);
     if (new TextDecoder().decode(plain) !== "vault-ok") throw new Error("bad verifier");
   } catch (_) {
-    $("#unlockError").hidden = false;
+    const err = $("#unlockError");
+    err.hidden = false;
+    err.style.animation = "none";
+    err.getBoundingClientRect();
+    err.style.animation = "";
     return;
   }
   state.key = key;
@@ -441,7 +505,6 @@ async function tryUnlock(pass) {
   $("#lockScreen").hidden = true;
   $("#lockBtn").hidden = !state.cfg.encrypted;
   render();
-  if (!state.items.length) toast("Vault unlocked — it's empty in here");
 }
 
 async function enableEncryption(newPass) {
@@ -526,13 +589,28 @@ async function importArchive(file) {
 /* ── Wiring ───────────────────────────────────────────────── */
 function wire() {
   /* Upload */
-  $("#uploadBtn").addEventListener("click", () => $("#fileInput").click());
-  $("#emptyUploadBtn").addEventListener("click", () => $("#fileInput").click());
+  const pick = () => $("#fileInput").click();
+  $("#uploadBtn").addEventListener("click", pick);
+  $("#emptyUploadBtn").addEventListener("click", pick);
+  $("#fab").addEventListener("click", pick);
   $("#fileInput").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
 
   /* Search & sort */
   $("#searchInput").addEventListener("input", (e) => { state.query = e.target.value; render(); });
-  $("#sortSelect").addEventListener("change", (e) => { state.sort = e.target.value; render(); });
+  $("#sortBtn").addEventListener("click", () => {
+    const i = SORTS.findIndex(([k]) => k === state.sort);
+    const [key, label] = SORTS[(i + 1) % SORTS.length];
+    state.sort = key;
+    $("#sortBtn").textContent = label;
+    render();
+  });
+  $("#sortBtn").textContent = SORTS[0][1];
+
+  /* HUD idle */
+  ["pointermove", "pointerdown", "keydown", "scroll", "focusin"].forEach((ev) =>
+    window.addEventListener(ev, pokeIdle, { passive: true })
+  );
+  pokeIdle();
 
   /* Drag & drop */
   let dragDepth = 0;
@@ -563,7 +641,7 @@ function wire() {
 
   /* Lightbox */
   $("#lbClose").addEventListener("click", closeLightbox);
-  $(".lightbox-backdrop").addEventListener("click", closeLightbox);
+  $(".lb-backdrop").addEventListener("click", closeLightbox);
   $("#lbPrev").addEventListener("click", () => stepLightbox(-1));
   $("#lbNext").addEventListener("click", () => stepLightbox(1));
   $("#lbFavorite").addEventListener("click", toggleFavorite);
@@ -686,17 +764,19 @@ function wire() {
   });
 
   /* Idle auto-lock (10 minutes) for encrypted vaults */
-  let idleTimer;
-  const resetIdle = () => {
-    clearTimeout(idleTimer);
+  let lockTimer;
+  const resetLock = () => {
+    clearTimeout(lockTimer);
     if (state.cfg.encrypted && !state.locked) {
-      idleTimer = setTimeout(lockVault, 10 * 60 * 1000);
+      lockTimer = setTimeout(lockVault, 10 * 60 * 1000);
     }
   };
-  ["pointerdown", "keydown", "pointermove"].forEach((ev) =>
-    window.addEventListener(ev, resetIdle, { passive: true })
+  ["pointerdown", "keydown"].forEach((ev) =>
+    window.addEventListener(ev, resetLock, { passive: true })
   );
-  resetIdle();
+  resetLock();
+
+  wireTilt();
 }
 
 function refreshSecurityUI() {

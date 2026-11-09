@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <meta name="description" content="VAULT — a private, local-first gallery for the random and the legendary. Images never leave your device." />
-  <title>VAULT — a private gallery</title>
+  <title>VAULT</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0c0a'/%3E%3Cpath d='M16 6l8 4.5v9L16 24l-8-4.5v-9L16 6z' fill='none' stroke='%23c9a45c' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='15' r='2.6' fill='%23c9a45c'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -15,171 +15,126 @@
 </head>
 <body>
 
-  <!-- ══════════ LOCK SCREEN ══════════ -->
-  <div id="lockScreen" class="lock-screen" hidden>
-    <div class="lock-inner">
-      <svg class="lock-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/>
-        <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>
-        <circle cx="12" cy="15.5" r="1.4" fill="currentColor" stroke="none"/>
-      </svg>
-      <h1 class="lock-title">The vault is locked</h1>
-      <p class="lock-sub">Enter your passphrase to decrypt your archive.</p>
-      <form id="unlockForm" class="lock-form">
-        <input id="unlockPass" type="password" placeholder="Passphrase" autocomplete="current-password" aria-label="Passphrase" required />
-        <button type="submit" class="btn btn-gold">Unlock</button>
-      </form>
-      <p id="unlockError" class="lock-error" role="alert" hidden>That passphrase doesn't fit this lock.</p>
-    </div>
-  </div>
-
-  <!-- ══════════ DROP OVERLAY ══════════ -->
-  <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
-    <div class="drop-frame">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5"/>
-        <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
-      </svg>
-      <p class="drop-title">Release to add to the vault</p>
-      <p class="drop-sub">Images stay on this device</p>
-    </div>
-  </div>
-
-  <!-- ══════════ APP ══════════ -->
-  <header class="site-header">
-    <div class="header-inner">
-      <a class="wordmark" href="#" aria-label="VAULT home">
-        <svg class="wordmark-glyph" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+  <!-- ══════════ HUD (auto-hides when idle) ══════════ -->
+  <header id="hud" class="hud">
+    <div class="hud-left">
+      <button id="brandBtn" class="brand" aria-label="VAULT">
+        <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
           <path d="M16 4l10 5.6v11.2L16 28 6 20.8V9.6L16 4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
           <circle cx="16" cy="16" r="3" fill="currentColor"/>
         </svg>
-        <span class="wordmark-text">VAULT</span>
-      </a>
-      <p id="artifactCount" class="artifact-count"></p>
-
-      <div class="header-actions">
-        <div class="search-wrap">
-          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>
-          </svg>
-          <input id="searchInput" type="search" placeholder="Search the archive" aria-label="Search the archive" />
-          <kbd>/</kbd>
-        </div>
-        <div class="select-wrap" title="Sort">
-          <select id="sortSelect" aria-label="Sort artifacts">
-            <option value="newest">Newest first</option>
-            <option value="oldest">Oldest first</option>
-            <option value="name">Name A–Z</option>
-            <option value="favorites">Favorites first</option>
-          </select>
-        </div>
-        <button id="lockBtn" class="btn btn-icon" title="Lock the vault" aria-label="Lock the vault" hidden>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="5" y="10.5" width="14" height="9.5" rx="2.5"/>
-            <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>
-          </svg>
-        </button>
-        <button id="securityBtn" class="btn btn-icon" title="Security & backup" aria-label="Security and backup">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3l7 3v5.5c0 4.7-3 7.6-7 9-4-1.4-7-4.3-7-9V6l7-3z"/>
-            <path d="M9.3 12.2l2 2 3.4-3.6"/>
-          </svg>
-        </button>
-        <button id="uploadBtn" class="btn btn-gold">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14"/>
-          </svg>
-          <span>Add images</span>
-        </button>
-        <input id="fileInput" type="file" accept="image/*" multiple hidden />
-      </div>
+        <span>VAULT</span>
+      </button>
+      <p id="artifactCount" class="hud-count"></p>
     </div>
-  </header>
-
-  <main id="main">
-    <!-- Empty state -->
-    <section id="emptyState" class="empty-state" hidden>
-      <div class="empty-mark" aria-hidden="true">
-        <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
-          <path d="M32 8l20 11.4v22.8L32 54 12 42.2V19.4L32 8z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
-          <path d="M32 20l11 6.3v12.4L32 45l-11-6.3V26.3L32 20z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" opacity="0.5"/>
-          <circle cx="32" cy="32" r="3" fill="currentColor"/>
+    <div class="hud-right">
+      <div class="search-wrap">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>
         </svg>
+        <input id="searchInput" type="search" placeholder="Search" aria-label="Search the archive" />
       </div>
-      <h2 class="empty-title">Nothing here yet.</h2>
-      <p class="empty-sub">This vault lives entirely on your device — a quiet archive for the random,<br class="hide-mobile" /> the cursed and the legendary. Drop images anywhere, paste from your clipboard, or…</p>
-      <button id="emptyUploadBtn" class="btn btn-gold btn-lg">Add the first artifact</button>
-    </section>
-
-    <!-- Grid -->
-    <section id="gridSection" class="grid-section" hidden>
-      <div id="grid" class="grid"></div>
-      <p id="noResults" class="no-results" hidden>No artifacts match that search.</p>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <div class="footer-inner">
-      <p class="footer-note">
+      <button id="sortBtn" class="hud-ghost" aria-label="Change sort order"></button>
+      <button id="lockBtn" class="hud-ghost hud-icon" title="Lock the vault" aria-label="Lock the vault" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="5" y="10.5" width="14" height="9.5" rx="2.5"/>
           <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>
         </svg>
-        Everything is stored locally in your browser. Nothing ever leaves this device.
-      </p>
-      <p id="storageStats" class="footer-stats"></p>
+      </button>
+      <button id="securityBtn" class="hud-ghost hud-icon" title="Security & backup" aria-label="Security and backup">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3l7 3v5.5c0 4.7-3 7.6-7 9-4-1.4-7-4.3-7-9V6l7-3z"/>
+          <path d="M9.3 12.2l2 2 3.4-3.6"/>
+        </svg>
+      </button>
+      <button id="uploadBtn" class="btn-add">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        <span>Add</span>
+      </button>
     </div>
-  </footer>
+  </header>
+
+  <input id="fileInput" type="file" accept="image/*" multiple hidden />
+
+  <!-- ══════════ MAIN ══════════ -->
+  <main id="main">
+    <section id="emptyState" class="empty-state" hidden>
+      <h2 class="empty-title">Nothing here yet.</h2>
+      <p class="empty-sub">Drop images anywhere, or paste from the clipboard.<br />Everything stays on this device — nothing is ever uploaded.</p>
+      <button id="emptyUploadBtn" class="btn-add btn-add-lg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        <span>Add the first</span>
+      </button>
+    </section>
+
+    <section id="gridSection" class="grid-section" hidden>
+      <div id="grid" class="grid"></div>
+      <p id="noResults" class="no-results" hidden>Nothing matches that.</p>
+    </section>
+  </main>
+
+  <!-- ══════════ FAB ══════════ -->
+  <button id="fab" class="fab" aria-label="Add images" title="Add images">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+      <path d="M12 5v14M5 12h14"/>
+    </svg>
+  </button>
+
+  <!-- ══════════ DROP OVERLAY ══════════ -->
+  <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
+    <div class="drop-frame">
+      <p class="drop-title">Release to add</p>
+      <p class="drop-sub">stays on this device</p>
+    </div>
+  </div>
 
   <!-- ══════════ LIGHTBOX ══════════ -->
   <div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="Artifact viewer">
-    <div class="lightbox-backdrop" data-close></div>
+    <div class="lb-backdrop" data-close></div>
     <button class="lb-nav lb-prev" id="lbPrev" aria-label="Previous artifact">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>
     </button>
     <figure class="lb-stage">
       <img id="lbImage" alt="" />
     </figure>
     <button class="lb-nav lb-next" id="lbNext" aria-label="Next artifact">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5L16 12l-6.5 6.5"/></svg>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5L16 12l-6.5 6.5"/></svg>
     </button>
 
-    <div class="lb-panel">
-      <div class="lb-meta">
+    <div class="lb-hud">
+      <div class="lb-info">
         <div class="lb-title-row">
           <h3 id="lbName" class="lb-name"></h3>
           <span id="lbIndex" class="lb-index"></span>
         </div>
         <p id="lbDetails" class="lb-details"></p>
         <div class="lb-fields">
-          <label class="field">
-            <span class="field-label">Caption</span>
-            <input id="lbCaption" type="text" placeholder="Add a caption…" autocomplete="off" />
-          </label>
-          <label class="field">
-            <span class="field-label">Tags</span>
-            <input id="lbTags" type="text" placeholder="comma, separated, tags" autocomplete="off" />
-          </label>
+          <input id="lbCaption" type="text" placeholder="Add a caption…" autocomplete="off" aria-label="Caption" />
+          <input id="lbTags" type="text" placeholder="tags, comma, separated" autocomplete="off" aria-label="Tags" />
         </div>
       </div>
       <div class="lb-actions">
-        <button id="lbFavorite" class="btn btn-icon" title="Favorite (F)" aria-label="Toggle favorite">
+        <button id="lbFavorite" class="lb-act" title="Favorite (F)" aria-label="Toggle favorite">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 3.8l2.5 5.2 5.7.8-4.1 4 1 5.6L12 16.7l-5.1 2.7 1-5.6-4.1-4 5.7-.8L12 3.8z"/>
           </svg>
         </button>
-        <button id="lbDownload" class="btn btn-icon" title="Download" aria-label="Download image">
+        <button id="lbDownload" class="lb-act" title="Download" aria-label="Download image">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14"/>
           </svg>
         </button>
-        <button id="lbDelete" class="btn btn-icon btn-danger" title="Delete (Del)" aria-label="Delete image">
+        <button id="lbDelete" class="lb-act" title="Delete (Del)" aria-label="Delete image">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M4.5 6.5h15M9.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 14.5 5v1.5M6.5 6.5l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12"/>
             <path d="M10 10.5v5.5M14 10.5v5.5"/>
           </svg>
         </button>
-        <button id="lbClose" class="btn btn-icon" title="Close (Esc)" aria-label="Close viewer">
+        <button id="lbClose" class="lb-act" title="Close (Esc)" aria-label="Close viewer">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
       </div>
@@ -192,7 +147,7 @@
     <div class="modal-card">
       <div class="modal-head">
         <h2 id="secTitle">Security &amp; backup</h2>
-        <button class="btn btn-icon" data-close-modal aria-label="Close">
+        <button class="modal-x" data-close-modal aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
       </div>
@@ -202,7 +157,7 @@
           <span class="sec-dot" aria-hidden="true"></span>
           <div>
             <strong>Local-only by design.</strong>
-            <p>Your images are written to this browser's IndexedDB on this device. There is no server, no account, no analytics, and no upload — the site itself is static.</p>
+            <p>Your images are written to this browser's IndexedDB on this device. No server, no account, no analytics, no upload.</p>
           </div>
         </div>
 
@@ -210,7 +165,7 @@
           <span class="sec-dot" aria-hidden="true"></span>
           <div>
             <strong>Optional vault encryption.</strong>
-            <p>Enable a passphrase and every image, thumbnail, caption and tag is encrypted with AES-256-GCM before it touches storage. The key is derived with PBKDF2 (310,000 iterations) and only ever exists in memory while the vault is unlocked.</p>
+            <p>Set a passphrase and every image, thumbnail, caption and tag is encrypted with AES-256-GCM before it touches storage. The key is derived with PBKDF2 (600,000 iterations) and only ever exists in memory while the vault is unlocked.</p>
           </div>
         </div>
 
@@ -249,11 +204,11 @@
           <div class="backup-actions">
             <button id="exportBtn" class="btn btn-ghost">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V4m0 0L8 8m4-4l4 4M5 19h14"/></svg>
-              Export archive
+              Export
             </button>
             <button id="importBtn" class="btn btn-ghost">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14"/></svg>
-              Restore archive
+              Restore
             </button>
             <input id="importInput" type="file" accept="application/json" hidden />
           </div>
@@ -274,6 +229,23 @@
           <button id="confirmDeleteBtn" class="btn btn-danger-solid">Delete</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ══════════ LOCK SCREEN ══════════ -->
+  <div id="lockScreen" class="lock-screen" hidden>
+    <div class="lock-inner">
+      <svg class="lock-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/>
+        <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>
+        <circle cx="12" cy="15.5" r="1.4" fill="currentColor" stroke="none"/>
+      </svg>
+      <h1 class="lock-title">Locked</h1>
+      <form id="unlockForm" class="lock-form">
+        <input id="unlockPass" type="password" placeholder="Passphrase" autocomplete="current-password" aria-label="Passphrase" required />
+        <button type="submit" class="btn btn-gold">Unlock</button>
+      </form>
+      <p id="unlockError" class="lock-error" role="alert" hidden>That passphrase doesn't fit this lock.</p>
     </div>
   </div>
 
