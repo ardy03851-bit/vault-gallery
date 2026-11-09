@@ -1,15 +1,16 @@
 /* ═══════════════════════════════════════════════════════════════
    VAULT — application logic
-   Local-first gallery. Images live in IndexedDB on this device.
-   Optional AES-256-GCM vault encryption (PBKDF2-derived key,
-   held in memory only while unlocked).
+   A minimal 3D world of images. Local-first gallery:
+   images live in IndexedDB on this device, optionally encrypted
+   with AES-256-GCM (PBKDF2-derived key, memory-only while unlocked).
    ═══════════════════════════════════════════════════════════════ */
 
-"use strict";
+import * as THREE from "three";
 
 /* ── Tiny helpers ─────────────────────────────────────────── */
 const $ = (sel) => document.querySelector(sel);
 const uid = () => crypto.randomUUID();
+const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function fmtBytes(n) {
   if (!n) return "0 B";
@@ -20,9 +21,6 @@ function fmtBytes(n) {
 }
 function fmtDate(ts) {
   return new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-}
-function esc(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 /* ── IndexedDB ────────────────────────────────────────────── */
@@ -78,15 +76,16 @@ async function idbDelete(store, key) {
     r.onerror = () => rej(r.error);
   });
 }
-
 const dbPromise = openDB();
 
-/* ── Crypto ───────────────────────────────────────────────── */
+/* ── Crypto (AES-256-GCM vault) ───────────────────────────── */
 const PBKDF2_ITERS = 600000;
 const VAULT_KEY = "vault";
+const enc = new TextEncoder();
+const dec = new TextDecoder();
 
 async function deriveKey(passphrase, salt) {
-  const baseKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: PBKDF2_ITERS, hash: "SHA-256" },
     baseKey,
@@ -98,12 +97,11 @@ async function deriveKey(passphrase, salt) {
 async function encryptBuf(key, data) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
-  return { iv, data: ct };
+  return { iv, ct };
 }
 async function decryptBuf(key, iv, data) {
-  return crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, data);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, key, data);
 }
-const enc = new TextEncoder();
 
 /* ── State ────────────────────────────────────────────────── */
 const SORTS = [
@@ -129,114 +127,94 @@ function metaOf(rec) {
   return meta;
 }
 async function encryptRecord(rec) {
-  const metaEnc = await encryptBuf(state.key, enc.encode(JSON.stringify(metaOf(rec))));
-  const blobEnc = await encryptBuf(state.key, await rec.blob.arrayBuffer());
-  const thumbEnc = rec.thumb ? await encryptBuf(state.key, await rec.thumb.arrayBuffer()) : null;
-  return { id: rec.id, encrypted: true, metaEnc, blobEnc, thumbEnc };
+  const { iv, ct } = await encryptBuf(state.key, await rec.blob.arrayBuffer());
+  const { iv: tiv, ct: tct } = await encryptBuf(state.key, await rec.thumb.arrayBuffer());
+  return { ...metaOf(rec), iv, ct, tiv, tct };
 }
 async function decryptRecord(row) {
-  const meta = JSON.parse(new TextDecoder().decode(await decryptBuf(state.key, row.metaEnc.iv, row.metaEnc.data)));
-  const blob = new Blob([await decryptBuf(state.key, row.blobEnc.iv, row.blobEnc.data)], { type: meta.type });
-  let thumb = null;
-  if (row.thumbEnc) thumb = new Blob([await decryptBuf(state.key, row.thumbEnc.iv, row.thumbEnc.data)], { type: "image/webp" });
-  return { ...meta, blob, thumb: thumb || blob };
+  const blob = new Blob([await decryptBuf(state.key, row.iv, row.ct)], { type: row.type });
+  const thumb = new Blob([await decryptBuf(state.key, row.tiv, row.tct)], { type: "image/webp" });
+  const { iv, ct, tiv, tct, ...meta } = row;
+  return { ...meta, blob, thumb };
 }
 async function putRecord(rec) {
-  const row = state.cfg.encrypted ? await encryptRecord(rec) : rec;
+  const row = state.key ? await encryptRecord(rec) : rec;
   await idbPut(STORE_ITEMS, row);
 }
 async function loadItems() {
   const rows = await idbGetAll(STORE_ITEMS);
+  if (!state.key) return rows;
   const out = [];
   for (const row of rows) {
-    out.push(row.encrypted ? await decryptRecord(row) : row);
+    try { out.push(await decryptRecord(row)); } catch (err) { console.error(err); }
   }
-  out.sort((a, b) => b.addedAt - a.addedAt);
   return out;
 }
 
-/* ── Object URLs ──────────────────────────────────────────── */
+/* ── Object-URL cache (memory only, never persisted) ───────── */
 function thumbURL(rec) {
-  let u = state.urls.get(rec.id);
-  if (!u) {
-    u = { thumb: URL.createObjectURL(rec.thumb), full: URL.createObjectURL(rec.blob) };
-    state.urls.set(rec.id, u);
-  }
+  if (!state.urls.has(rec.id)) state.urls.set(rec.id, {});
+  const u = state.urls.get(rec.id);
+  if (!u.thumb) u.thumb = URL.createObjectURL(rec.thumb);
   return u.thumb;
 }
 function fullURL(rec) {
-  thumbURL(rec);
-  return state.urls.get(rec.id).full;
+  if (!state.urls.has(rec.id)) state.urls.set(rec.id, {});
+  const u = state.urls.get(rec.id);
+  if (!u.full) u.full = URL.createObjectURL(rec.blob);
+  return u.full;
 }
 function dropURLs(id) {
   const u = state.urls.get(id);
-  if (u) {
-    URL.revokeObjectURL(u.thumb);
-    URL.revokeObjectURL(u.full);
-    state.urls.delete(id);
-  }
+  if (u) { if (u.thumb) URL.revokeObjectURL(u.thumb); if (u.full) URL.revokeObjectURL(u.full); }
+  state.urls.delete(id);
 }
 function dropAllURLs() {
-  for (const id of state.urls.keys()) dropURLs(id);
+  for (const id of [...state.urls.keys()]) dropURLs(id);
 }
 
 /* ── Toasts ───────────────────────────────────────────────── */
-function toast(msg, ms = 2800) {
+function toast(msg, ms = 2600) {
   const el = document.createElement("div");
   el.className = "toast";
-  el.innerHTML =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>' +
-    esc(msg);
+  el.textContent = msg;
   $("#toasts").appendChild(el);
+  requestAnimationFrame(() => el.classList.add("in"));
   setTimeout(() => {
-    el.classList.add("leaving");
-    el.addEventListener("animationend", () => el.remove(), { once: true });
+    el.classList.remove("in");
     setTimeout(() => el.remove(), 400);
   }, ms);
 }
 
-/* ── Image processing ─────────────────────────────────────── */
+/* ── Image intake ─────────────────────────────────────────── */
 async function loadBitmap(file) {
-  if ("createImageBitmap" in window) {
-    try { return await createImageBitmap(file); } catch (_) { /* fall through */ }
-  }
+  if ("createImageBitmap" in window) return createImageBitmap(file);
   return new Promise((res, rej) => {
-    const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = () => { URL.revokeObjectURL(url); res(img); };
-    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("decode failed")); };
-    img.src = url;
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = URL.createObjectURL(file);
   });
 }
 function makeThumb(bitmap, maxEdge = 560) {
   const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
-  const w = Math.max(1, Math.round(bitmap.width * scale));
-  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const w = Math.round(bitmap.width * scale);
+  const h = Math.round(bitmap.height * scale);
   const canvas = document.createElement("canvas");
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(bitmap, 0, 0, w, h);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
   return new Promise((res) => {
     canvas.toBlob(
       (b) => {
         if (b && b.type === "image/webp") return res(b);
-        const c2 = document.createElement("canvas");
-        c2.width = w; c2.height = h;
-        const ctx2 = c2.getContext("2d");
-        ctx2.fillStyle = "#141210";
-        ctx2.fillRect(0, 0, w, h);
-        ctx2.drawImage(bitmap, 0, 0, w, h);
-        c2.toBlob((b2) => res(b2 || b), "image/jpeg", 0.82);
+        canvas.toBlob((b2) => res(b2 || new Blob([], { type: "image/jpeg" })), "image/jpeg", 0.85);
       },
       "image/webp",
       0.82
     );
   });
 }
-
-/* ── Upload ───────────────────────────────────────────────── */
 async function addFiles(fileList) {
   const files = [...fileList].filter((f) => f.type.startsWith("image/"));
   if (!files.length) return;
@@ -253,8 +231,7 @@ async function addFiles(fileList) {
         name: file.name.replace(/\.[a-z0-9]+$/i, "") || "Untitled",
         type: file.type || "image/*",
         size: file.size,
-        w,
-        h,
+        w, h,
         addedAt: Date.now(),
         caption: "",
         tags: [],
@@ -276,7 +253,7 @@ async function addFiles(fileList) {
   }
 }
 
-/* ── Rendering ────────────────────────────────────────────── */
+/* ── Sorting / filtering ──────────────────────────────────── */
 function visibleItems() {
   let list = state.items;
   const q = state.query.trim().toLowerCase();
@@ -294,238 +271,466 @@ function visibleItems() {
   return [...list].sort(sorters[state.sort]);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   THE WORLD — three.js gallery in the void
+   ═══════════════════════════════════════════════════════════════ */
+const world = (() => {
+  const canvas = $("#stage");
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  } catch (err) {
+    console.error(err);
+    return { sync() {}, onRender() {} };
+  }
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x0a0b0d, 900, 2600);
+  const camera = new THREE.PerspectiveCamera(46, 1, 1, 8000);
+  camera.position.set(0, 0, 1400);
+  const group = new THREE.Group();
+  scene.add(group);
+
+  const textureLoader = new THREE.TextureLoader();
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2(-10, -10);
+  let hovered = null;
+  let camTargetZ = 1400;
+  let camMinZ = 400;
+  let camMaxZ = 3000;
+
+  /* rotation: user drag + ambient drift */
+  let rotY = 0, rotX = 0, rotVel = 0;
+  let dragging = false, downX = 0, downY = 0, moved = 0, lastX = 0;
+
+  /* ── resize ── */
+  function resize() {
+    const w = innerWidth, h = innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  /* ── pointer interactions ── */
+  canvas.style.touchAction = "none";
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    moved = 0;
+    downX = lastX = e.clientX;
+    downY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.classList.add("dragging");
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    pointer.x = (e.clientX / innerWidth) * 2 - 1;
+    pointer.y = -(e.clientY / innerHeight) * 2 + 1;
+    if (dragging) {
+      const dx = e.clientX - lastX;
+      moved += Math.abs(dx) + Math.abs(e.clientY - downY) * 0;
+      lastX = e.clientX;
+      rotVel = dx * 0.0032;
+      rotY = THREE.MathUtils.clamp(rotY + rotVel, -0.62, 0.62);
+      rotX = THREE.MathUtils.clamp(rotX + (e.clientY - downY) * 0.0006, -0.14, 0.14);
+      downY = e.clientY;
+    }
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    canvas.classList.remove("dragging");
+    if (moved < 6 && e.type === "pointerup") {
+      /* treat as click → raycast */
+      const hit = pick();
+      if (hit) openLightbox(hit.userData.rec.id);
+    }
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", () => { dragging = false; canvas.classList.remove("dragging"); });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    camTargetZ = THREE.MathUtils.clamp(camTargetZ + e.deltaY * 1.15, camMinZ, camMaxZ);
+  }, { passive: false });
+
+  function pick() {
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObjects(group.children, false);
+    return hits.length ? hits[0].object : null;
+  }
+
+  /* ── layout ── */
+  function layout(meshes) {
+    const n = meshes.length;
+    const cols = Math.max(1, Math.min(7, Math.round(Math.sqrt(n * 1.35)) || 1));
+    const H = 320, GAP = 90, CELL = 420;
+    const colH = new Array(cols).fill(0);
+    for (const m of meshes) {
+      const a = m.userData.aspect;
+      let w = H * a, h = H;
+      if (w > CELL) { w = CELL; h = w / a; }
+      if (h > 420) { h = 420; w = h * a; }
+      let c = 0;
+      for (let i = 1; i < cols; i++) if (colH[i] < colH[c] - 1) c = i;
+      const x = (c - (cols - 1) / 2) * (CELL + GAP);
+      const y = -(colH[c] + h / 2 + GAP / 2);
+      colH[c] += h + GAP;
+      m.userData.tx = x;
+      m.userData.ty = y;
+      m.userData.tw = w;
+      m.userData.th = h;
+    }
+    const totalH = Math.max(...colH, 0);
+    const totalW = cols * (CELL + GAP) - GAP;
+    for (const m of meshes) m.userData.ty += totalH / 2;
+    /* fit camera */
+    camTargetZ = Math.max(totalH, totalW * (innerHeight / innerWidth) * 0.9) * 0.78 + 650;
+    camMinZ = 420;
+    camMaxZ = Math.max(camTargetZ * 1.9, 2600);
+    camTargetZ = THREE.MathUtils.clamp(camTargetZ, camMinZ, camMaxZ);
+    scene.fog.near = camTargetZ * 0.45;
+    scene.fog.far = camTargetZ * 2.35;
+  }
+
+  /* ── build a mesh for a record ── */
+  function makeMesh(rec) {
+    const aspect = rec.w / rec.h;
+    const geo = new THREE.PlaneGeometry(1, 1);
+    const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.rec = rec;
+    mesh.userData.aspect = aspect;
+    mesh.userData.born = performance.now();
+    mesh.userData.lift = 0;
+    mesh.userData.dim = 1;
+    mesh.userData.jz = ((rec.addedAt % 1000) / 1000 - 0.5) * 130;
+    mesh.userData.jr = ((rec.addedAt % 700) / 700 - 0.5) * 0.09;
+    /* load texture */
+    const url = thumbURL(rec);
+    textureLoader.load(url, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      mesh.material.map = tex;
+      mesh.material.needsUpdate = true;
+    });
+    /* favorite edge */
+    const edge = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)),
+      new THREE.LineBasicMaterial({ color: 0x8fb0c4, transparent: true, opacity: 0 })
+    );
+    edge.userData.isEdge = true;
+    mesh.add(edge);
+    group.add(mesh);
+    return mesh;
+  }
+
+  function disposeMesh(mesh) {
+    group.remove(mesh);
+    mesh.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (o.material.map) o.material.map.dispose();
+        o.material.dispose();
+      }
+    });
+  }
+
+  /* ── sync world with records ── */
+  function sync(allItems, visItems) {
+    const keep = new Set(visItems.map((r) => r.id));
+    const present = new Set(allItems.map((r) => r.id));
+    /* remove stale meshes */
+    for (const mesh of [...group.children]) {
+      if (!present.has(mesh.userData.rec.id)) disposeMesh(mesh);
+    }
+    /* ensure meshes for all present items */
+    const byId = new Map(group.children.map((m) => [m.userData.rec.id, m]));
+    for (const rec of allItems) if (!byId.has(rec.id)) makeMesh(rec);
+    const meshes = [...group.children];
+    /* layout in visible order */
+    layout(meshes.filter((m) => keep.has(m.userData.rec.id)));
+    /* dim state */
+    for (const m of meshes) m.userData.dim = keep.has(m.userData.rec.id) ? 1 : 0.05;
+    /* favorite edges */
+    for (const m of meshes) {
+      const fav = !!m.userData.rec.favorite;
+      for (const child of m.children) if (child.userData.isEdge) child.userData.targetOpacity = fav ? 0.55 : 0;
+    }
+  }
+
+  /* ── frame loop ── */
+  let lastT = performance.now();
+  function tick() {
+    requestAnimationFrame(tick);
+    const now = performance.now();
+    const t = now / 1000;
+    const dt = Math.min((now - lastT) / 1000, 0.05);
+    lastT = now;
+
+    /* inertia + ambient drift */
+    if (!dragging) {
+      rotY += rotVel;
+      rotVel *= 0.94;
+      rotY = THREE.MathUtils.clamp(rotY, -0.62, 0.62);
+    }
+    const ambient = REDUCED ? 0 : Math.sin(t * 0.16) * 0.016;
+    group.rotation.y = rotY + ambient;
+    group.rotation.x = rotX + (REDUCED ? 0 : Math.sin(t * 0.11) * 0.008);
+
+    /* camera dolly */
+    camera.position.z += (camTargetZ - camera.position.z) * 0.06;
+
+    /* hover */
+    if (!dragging && !document.body.classList.contains("ui-open")) {
+      const hit = pick();
+      if (hit !== hovered) {
+        hovered = hit;
+        canvas.style.cursor = hit ? "pointer" : "";
+      }
+    } else if (hovered) {
+      hovered = null;
+      canvas.style.cursor = "grab";
+    }
+
+    /* animate meshes */
+    for (const m of group.children) {
+      const d = m.userData;
+      /* entrance */
+      let scale = 1;
+      if (!REDUCED && now - d.born < 850) {
+        const p = (now - d.born) / 850;
+        scale = 1 - Math.pow(1 - p, 4);
+        scale = 0.001 + scale * 0.999;
+      }
+      /* hover lift */
+      d.lift += (((hovered === m) ? 85 : 0) - d.lift) * 0.16;
+      const hoverScale = (hovered === m) ? 1.045 : 1;
+      /* position lerp */
+      const lerp = 1 - Math.pow(0.0018, dt);
+      m.position.x += (d.tx - m.position.x) * lerp;
+      m.position.y += (d.ty - m.position.y) * lerp;
+      m.position.z += ((d.tz || 0) + d.lift - m.position.z) * lerp;
+      /* size */
+      const w = d.tw || 1, h = d.th || 1;
+      m.scale.set(w * scale * hoverScale, h * scale * hoverScale, 1);
+      m.rotation.y = d.jr;
+      /* opacity */
+      const targetOp = d.dim * (hovered === m ? 1 : 0.94);
+      m.material.opacity += (targetOp - m.material.opacity) * 0.14;
+      /* favorite edge */
+      for (const child of m.children) {
+        if (child.userData.isEdge) {
+          const to = child.userData.targetOpacity || 0;
+          child.material.opacity += (to - child.material.opacity) * 0.12;
+          child.position.z = 1;
+          const s = w * 1.035;
+          child.scale.set(s / w * (w / (d.tw || 1)), h * 1.035 / (d.th || 1), 1);
+          child.visible = child.material.opacity > 0.02;
+        }
+      }
+    }
+    renderer.render(scene, camera);
+  }
+  tick();
+
+  return {
+    sync,
+    group,
+    refresh() { sync(state.items, visibleItems()); },
+  };
+})();
+
+/* ── Rendering (DOM chrome) ────────────────────────────────── */
 function render() {
   const items = state.items;
   const total = items.length;
-  const favs = items.filter((r) => r.favorite).length;
   const bytes = items.reduce((s, r) => s + (r.size || 0), 0);
 
-  $("#artifactCount").textContent = total
-    ? total + (total === 1 ? " artifact" : " artifacts") + (favs ? " · " + favs + " ★" : "") + " · " + fmtBytes(bytes)
+  $("#worldStats").textContent = total
+    ? total + (total === 1 ? " artifact" : " artifacts") + " · " + fmtBytes(bytes) + " · local only"
     : "";
 
   const vis = visibleItems();
-  const empty = total === 0;
-  $("#emptyState").hidden = !empty;
-  $("#gridSection").hidden = empty;
-  $("#noResults").hidden = !(empty === false && vis.length === 0);
-  $("#fab").hidden = empty;
+  $("#emptyState").hidden = total !== 0;
+  world.sync(items, vis);
 
-  const grid = $("#grid");
-  grid.innerHTML = "";
-  vis.forEach((rec, i) => {
-    const cell = document.createElement("button");
-    cell.className = "cell";
-    cell.style.setProperty("--i", i);
-    cell.setAttribute("aria-label", "Open " + rec.name);
-    const chips = (rec.tags || []).slice(0, 3).map((t) => '<span class="tag-chip">#' + esc(t) + "</span>").join("");
-    const cap = (chips ? " " : "") + (rec.caption ? esc(rec.caption) : esc(rec.name));
-    cell.innerHTML =
-      '<img src="' + thumbURL(rec) + '" alt="' + esc(rec.name) + '" loading="lazy" />' +
-      '<span class="cell-fav' + (rec.favorite ? " active filled" : "") + '" aria-hidden="true">' +
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8l2.5 5.2 5.7.8-4.1 4 1 5.6L12 16.7l-5.1 2.7 1-5.6-4.1-4 5.7-.8L12 3.8z"/></svg></span>' +
-      '<span class="cell-caption' + (rec.caption ? " has-caption" : "") + '">' + chips + cap + "</span>";
-    cell.addEventListener("click", () => openLightbox(rec.id, cell));
-    grid.appendChild(cell);
-  });
+  if (state.lightboxId && !$("#lightbox").hidden) {
+    if (!vis.some((r) => r.id === state.lightboxId)) closeLightbox();
+  }
+  updateSearchCount();
 }
 
-/* ── 2.5D tilt ────────────────────────────────────────────── */
-function wireTilt() {
-  const grid = $("#grid");
-  let active = null;
-  const reset = () => {
-    if (!active) return;
-    active.style.setProperty("--rx", "0deg");
-    active.style.setProperty("--ry", "0deg");
-    active.style.setProperty("--tz", "0px");
-    active = null;
-  };
-  grid.addEventListener("pointermove", (e) => {
-    if (e.pointerType === "touch") return;
-    const cell = e.target.closest(".cell");
-    if (cell !== active) reset();
-    if (!cell) return;
-    active = cell;
-    const r = cell.getBoundingClientRect();
-    const px = (e.clientX - r.left) / r.width - 0.5;
-    const py = (e.clientY - r.top) / r.height - 0.5;
-    cell.style.setProperty("--rx", (-py * 10).toFixed(2) + "deg");
-    cell.style.setProperty("--ry", (px * 12).toFixed(2) + "deg");
-    cell.style.setProperty("--tz", "14px");
-  }, { passive: true });
-  grid.addEventListener("pointerleave", reset);
+/* ── Search overlay ───────────────────────────────────────── */
+function openSearch() {
+  const ov = $("#searchOverlay");
+  ov.hidden = false;
+  requestAnimationFrame(() => ov.classList.add("open"));
+  $("#searchInput").focus();
 }
-
-/* ── HUD auto-hide ────────────────────────────────────────── */
-let idleTimer = null;
-function pokeIdle() {
-  document.body.classList.remove("idle");
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
-    const modalOpen = !$("#securityModal").hidden || !$("#confirmModal").hidden;
-    if (!typing && !modalOpen) document.body.classList.add("idle");
-  }, 2600);
+function closeSearch() {
+  const ov = $("#searchOverlay");
+  ov.classList.remove("open");
+  setTimeout(() => { ov.hidden = true; }, 220);
+  if (state.query) { state.query = ""; $("#searchInput").value = ""; render(); }
+}
+function updateSearchCount() {
+  if (!state.query.trim()) { $("#searchCount").textContent = ""; return; }
+  const vis = visibleItems().length;
+  $("#searchCount").textContent = vis + (vis === 1 ? " match" : " matches");
 }
 
 /* ── Lightbox ─────────────────────────────────────────────── */
 function lbList() { return visibleItems(); }
 function currentRec() { return state.items.find((r) => r.id === state.lightboxId); }
 
-function openLightbox(id, fromCell) {
+function openLightbox(id) {
   state.lightboxId = id;
-  const rec = currentRec();
-  if (!rec) return;
   $("#lightbox").hidden = false;
-  document.body.classList.add("lb-open");
-  document.body.style.overflow = "hidden";
+  requestAnimationFrame(() => $("#lightbox").classList.add("open"));
   updateLightbox();
-  pokeIdle();
-
-  /* FLIP — the image flies out of the grid cell into the center */
-  if (fromCell) {
-    const img = $("#lbImage");
-    const fromImg = fromCell.querySelector("img");
-    (async () => {
-      try { await img.decode(); } catch (_) { /* already decoded */ }
-      requestAnimationFrame(() => {
-        if (!fromImg.isConnected) return;
-        const from = fromImg.getBoundingClientRect();
-        const to = img.getBoundingClientRect();
-        if (!to.width || !to.height) return;
-        const dx = from.left + from.width / 2 - (to.left + to.width / 2);
-        const dy = from.top + from.height / 2 - (to.top + to.height / 2);
-        const sx = from.width / to.width;
-        const sy = from.height / to.height;
-        img.style.transition = "none";
-        img.style.transform = "translate(" + dx.toFixed(1) + "px, " + dy.toFixed(1) + "px) scale(" + sx.toFixed(4) + ", " + sy.toFixed(4) + ")";
-        img.getBoundingClientRect(); // force reflow
-        img.style.transition = "";
-        img.style.transform = "";
-      });
-    })();
-  }
 }
 function closeLightbox() {
+  const lb = $("#lightbox");
+  lb.classList.remove("open");
+  setTimeout(() => { lb.hidden = true; }, 260);
   state.lightboxId = null;
-  $("#lightbox").hidden = true;
-  document.body.classList.remove("lb-open");
-  document.body.style.overflow = "";
+  saveLightboxMeta();
 }
 function stepLightbox(dir) {
   const list = lbList();
-  const idx = list.findIndex((r) => r.id === state.lightboxId);
-  if (idx === -1 || !list.length) return;
-  const next = list[(idx + dir + list.length) % list.length];
-  state.lightboxId = next.id;
+  const i = list.findIndex((r) => r.id === state.lightboxId);
+  if (i === -1 || !list.length) return;
+  state.lightboxId = list[(i + dir + list.length) % list.length].id;
   updateLightbox();
 }
 function updateLightbox() {
   const rec = currentRec();
-  if (!rec) return closeLightbox();
+  if (!rec) return;
   const list = lbList();
-  const idx = list.findIndex((r) => r.id === rec.id);
-
+  const i = list.findIndex((r) => r.id === rec.id);
   const img = $("#lbImage");
-  img.src = fullURL(rec);
-  img.alt = rec.caption || rec.name;
+  const url = fullURL(rec);
+  if (img.dataset.url !== url) {
+    img.dataset.url = url;
+    img.src = url;
+  }
+  img.alt = rec.name;
   $("#lbName").textContent = rec.name;
-  $("#lbIndex").textContent = idx + 1 + " / " + list.length;
-  $("#lbDetails").textContent =
-    fmtDate(rec.addedAt) + " · " + rec.w + "×" + rec.h + " · " + fmtBytes(rec.size);
+  $("#lbIndex").textContent = (i + 1) + " / " + list.length;
+  $("#lbDetails").textContent = rec.w + " × " + rec.h + " · " + fmtBytes(rec.size) + " · " + fmtDate(rec.addedAt);
   $("#lbCaption").value = rec.caption || "";
   $("#lbTags").value = (rec.tags || []).join(", ");
   $("#lbFavorite").classList.toggle("active", !!rec.favorite);
-  $("#lbFavorite").setAttribute("aria-pressed", String(!!rec.favorite));
+  const prevRec = list[(i - 1 + list.length) % list.length];
+  $("#lbImage").style.viewTransitionName = "";
+  document.querySelector(".lb-stage").setAttribute("data-name", rec.name);
 }
 async function saveLightboxMeta() {
   const rec = currentRec();
   if (!rec) return;
-  const caption = $("#lbCaption").value.trim();
-  const tags = $("#lbTags").value.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
-  if (caption === rec.caption && JSON.stringify(tags) === JSON.stringify(rec.tags || [])) return;
-  rec.caption = caption;
-  rec.tags = tags;
-  await putRecord(rec);
-  render();
+  const cap = $("#lbCaption").value.trim();
+  const tags = $("#lbTags").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const fav = $("#lbFavorite").classList.contains("active");
+  if (cap !== (rec.caption || "") || JSON.stringify(tags) !== JSON.stringify(rec.tags || []) || fav !== !!rec.favorite) {
+    rec.caption = cap;
+    rec.tags = tags;
+    rec.favorite = fav;
+    await putRecord(rec);
+    render();
+  }
 }
 async function toggleFavorite() {
   const rec = currentRec();
   if (!rec) return;
   rec.favorite = !rec.favorite;
+  $("#lbFavorite").classList.toggle("active", rec.favorite);
   await putRecord(rec);
   render();
-  updateLightbox();
+}
+async function deleteCurrent() {
+  const rec = currentRec();
+  if (!rec) return;
+  await idbDelete(STORE_ITEMS, rec.id);
+  dropURLs(rec.id);
+  state.items = state.items.filter((r) => r.id !== rec.id);
+  $("#confirmModal").hidden = true;
+  toast("Removed from the vault");
+  const list = lbList();
+  if (list.length) { state.lightboxId = list[0].id; updateLightbox(); }
+  else closeLightbox();
+  render();
 }
 
-/* ── Security / vault ─────────────────────────────────────── */
+/* ── Vault locking ─────────────────────────────────────────── */
 async function readCfg() {
-  const cfg = await idbGet(STORE_META, VAULT_KEY);
-  state.cfg = cfg && cfg.encrypted ? cfg : { encrypted: false };
+  const row = await idbGet(STORE_META, VAULT_KEY);
+  if (row && typeof row === "object") state.cfg = row;
 }
 async function writeCfg() {
   await idbPut(STORE_META, state.cfg, VAULT_KEY);
 }
-
 async function lockVault() {
   dropAllURLs();
   state.items = [];
-  state.key = null;
   state.locked = true;
-  state.lightboxId = null;
-  closeLightbox();
-  $("#grid").innerHTML = "";
-  $("#emptyState").hidden = true;
-  $("#gridSection").hidden = true;
-  $("#unlockPass").value = "";
-  $("#unlockError").hidden = true;
-  $("#lockScreen").hidden = false;
-  $("#lockBtn").hidden = true;
-  setTimeout(() => $("#unlockPass").focus(), 60);
+  state.key = null;
+  state.query = "";
+  $("#searchInput").value = "";
+  $("#lightbox").hidden = true;
+  $("#lightbox").classList.remove("open");
+  $("#securityModal").hidden = true;
+  render();
+  const ls = $("#lockScreen");
+  ls.hidden = false;
+  requestAnimationFrame(() => ls.classList.add("open"));
+  setTimeout(() => $("#unlockPass").focus(), 300);
 }
-
 async function tryUnlock(pass) {
-  const salt = Uint8Array.from(atob(state.cfg.salt), (c) => c.charCodeAt(0));
-  const key = await deriveKey(pass, salt);
   try {
-    const plain = await decryptBuf(key, new Uint8Array(state.cfg.verifier.iv), state.cfg.verifier.data);
-    if (new TextDecoder().decode(plain) !== "vault-ok") throw new Error("bad verifier");
+    const salt = Uint8Array.from(atob(state.cfg.salt), (c) => c.charCodeAt(0));
+    const key = await deriveKey(pass, salt);
+    const ver = await decryptBuf(key, state.cfg.verifierIv, state.cfg.verifierCt);
+    if (dec.decode(ver) !== "vault-ok") throw new Error();
+    state.key = key;
   } catch (_) {
-    const err = $("#unlockError");
-    err.hidden = false;
-    err.style.animation = "none";
-    err.getBoundingClientRect();
-    err.style.animation = "";
+    $("#unlockError").hidden = false;
+    setTimeout(() => { $("#unlockError").hidden = true; }, 2200);
     return;
   }
-  state.key = key;
+  $("#lockError")?.remove();
+  const ls = $("#lockScreen");
+  ls.classList.remove("open");
+  setTimeout(() => { ls.hidden = true; }, 380);
   state.locked = false;
   state.items = await loadItems();
-  $("#lockScreen").hidden = true;
-  $("#lockBtn").hidden = !state.cfg.encrypted;
   render();
 }
-
 async function enableEncryption(newPass) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(newPass, salt);
-  const verifier = await encryptBuf(key, enc.encode("vault-ok"));
+  const { iv: vIv, ct: vCt } = await encryptBuf(key, enc.encode("vault-ok"));
   state.key = key;
-  state.cfg = { encrypted: true, salt: btoa(String.fromCharCode(...salt)), verifier };
+  state.cfg = {
+    encrypted: true,
+    salt: btoa(String.fromCharCode(...salt)),
+    verifierIv: vIv,
+    verifierCt: vCt,
+  };
   for (const rec of state.items) await putRecord(rec);
   await writeCfg();
-  $("#lockBtn").hidden = false;
-  render();
-  toast("Vault encrypted — AES-256-GCM active");
+  $("#orbLock").hidden = false;
+  refreshSecurityUI();
+  toast("Vault encrypted — AES-256-GCM");
 }
 async function disableEncryption() {
   state.cfg = { encrypted: false };
   state.key = null;
   for (const rec of state.items) await putRecord(rec);
-  await idbPut(STORE_META, state.cfg, VAULT_KEY);
-  $("#lockBtn").hidden = true;
+  await writeCfg();
+  $("#orbLock").hidden = true;
   toast("Encryption removed — images stay local");
+  refreshSecurityUI();
 }
 
 /* ── Export / import ──────────────────────────────────────── */
@@ -586,57 +791,117 @@ async function importArchive(file) {
   else toast("Nothing new to restore");
 }
 
+/* ── Security modal UI ────────────────────────────────────── */
+function refreshSecurityUI() {
+  const isOn = state.cfg.encrypted;
+  const btn = $("#encToggleBtn");
+  btn.textContent = isOn ? "Manage" : "Enable";
+  btn.className = "btn " + (isOn ? "btn-ghost" : "btn-accent");
+  $("#secStatus").textContent = isOn
+    ? "On — AES-256-GCM, key in memory only"
+    : "Off — images stored locally, unencrypted";
+}
+
 /* ── Wiring ───────────────────────────────────────────────── */
+function closeMenu() {
+  $("#menuToggle").checked = false;
+}
+
 function wire() {
-  /* Upload */
-  const pick = () => $("#fileInput").click();
-  $("#uploadBtn").addEventListener("click", pick);
-  $("#emptyUploadBtn").addEventListener("click", pick);
-  $("#fab").addEventListener("click", pick);
-  $("#fileInput").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
-
-  /* Search & sort */
-  $("#searchInput").addEventListener("input", (e) => { state.query = e.target.value; render(); });
-  $("#sortBtn").addEventListener("click", () => {
-    const i = SORTS.findIndex(([k]) => k === state.sort);
-    const [key, label] = SORTS[(i + 1) % SORTS.length];
-    state.sort = key;
-    $("#sortBtn").textContent = label;
-    render();
-  });
-  $("#sortBtn").textContent = SORTS[0][1];
-
-  /* HUD idle */
-  ["pointermove", "pointerdown", "keydown", "scroll", "focusin"].forEach((ev) =>
-    window.addEventListener(ev, pokeIdle, { passive: true })
+  const uiOpen = () => ["#lightbox", "#securityModal", "#confirmModal", "#lockScreen"].some((s) => !$(s).hidden);
+  const syncUiClass = () => document.body.classList.toggle("ui-open", uiOpen());
+  const obs = new MutationObserver(syncUiClass);
+  ["#lightbox", "#securityModal", "#confirmModal", "#lockScreen"].forEach((s) =>
+    obs.observe($(s), { attributes: true, attributeFilter: ["hidden"] })
   );
-  pokeIdle();
 
-  /* Drag & drop */
-  let dragDepth = 0;
-  const overlay = $("#dropOverlay");
-  window.addEventListener("dragenter", (e) => {
-    if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
+  /* Orbital menu actions */
+  $("#orbital").addEventListener("click", (e) => {
+    const opt = e.target.closest(".orb-option");
+    if (!opt) return;
     e.preventDefault();
-    dragDepth++;
-    overlay.classList.add("active");
+    closeMenu();
+    const action = opt.dataset.action;
+    if (action === "add") $("#fileInput").click();
+    if (action === "search") openSearch();
+    if (action === "sort") cycleSort();
+    if (action === "security") openModal("#securityModal");
+    if (action === "lock") lockVault();
   });
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("dragleave", (e) => {
-    if (--dragDepth <= 0) { dragDepth = 0; overlay.classList.remove("active"); }
+  $("#menuToggle").addEventListener("change", (e) => {
+    document.body.classList.toggle("menu-open", e.target.checked);
   });
-  window.addEventListener("drop", (e) => {
-    e.preventDefault();
-    dragDepth = 0;
-    overlay.classList.remove("active");
-    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+
+  /* Sort cycling */
+  function cycleSort() {
+    const i = SORTS.findIndex((s) => s[0] === state.sort);
+    state.sort = SORTS[(i + 1) % SORTS.length][0];
+    render();
+    toast("Sorted · " + SORTS.find((s) => s[0] === state.sort)[1]);
+  }
+
+  /* Modals */
+  function openModal(sel) {
+    const m = $(sel);
+    m.hidden = false;
+    requestAnimationFrame(() => m.classList.add("open"));
+    refreshSecurityUI();
+  }
+  function closeModal(sel) {
+    const m = $(sel);
+    m.classList.remove("open");
+    setTimeout(() => { m.hidden = true; }, 240);
+  }
+  document.querySelectorAll("[data-close-modal]").forEach((el) =>
+    el.addEventListener("click", () => {
+      closeModal("#securityModal");
+      closeModal("#confirmModal");
+      $("#passForm").hidden = true;
+    })
+  );
+
+  /* Upload paths */
+  $("#fileInput").addEventListener("change", (e) => {
+    if (e.target.files.length) addFiles(e.target.files);
+    e.target.value = "";
   });
+  $("#emptyUploadBtn").addEventListener("click", () => $("#fileInput").click());
 
   /* Paste */
   window.addEventListener("paste", (e) => {
-    if (state.locked) return;
-    const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
-    if (files.length) { e.preventDefault(); addFiles(files); }
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) addFiles(files);
+  });
+
+  /* Drag & drop */
+  let dragDepth = 0;
+  window.addEventListener("dragenter", (e) => {
+    if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
+    dragDepth++;
+    $("#dropOverlay").classList.add("active");
+  });
+  window.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) $("#dropOverlay").classList.remove("active");
+  });
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    $("#dropOverlay").classList.remove("active");
+    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+  });
+
+  /* Search */
+  $("#searchInput").addEventListener("input", (e) => {
+    state.query = e.target.value;
+    render();
+  });
+  $("#searchOverlay").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (state.query) { state.query = ""; $("#searchInput").value = ""; render(); }
+      else closeSearch();
+    }
   });
 
   /* Lightbox */
@@ -645,69 +910,51 @@ function wire() {
   $("#lbPrev").addEventListener("click", () => stepLightbox(-1));
   $("#lbNext").addEventListener("click", () => stepLightbox(1));
   $("#lbFavorite").addEventListener("click", toggleFavorite);
-  $("#lbCaption").addEventListener("change", saveLightboxMeta);
-  $("#lbTags").addEventListener("change", saveLightboxMeta);
+  $("#lbDelete").addEventListener("click", () => openModal("#confirmModal"));
+  $("#confirmDeleteBtn").addEventListener("click", deleteCurrent);
   $("#lbDownload").addEventListener("click", () => {
     const rec = currentRec();
     if (!rec) return;
     const a = document.createElement("a");
     a.href = fullURL(rec);
-    a.download = rec.name + (rec.type.includes("png") ? ".png" : rec.type.includes("webp") ? ".webp" : rec.type.includes("gif") ? ".gif" : ".jpg");
+    a.download = rec.name + "." + (rec.type.split("/")[1] || "png");
     a.click();
   });
-  $("#lbDelete").addEventListener("click", () => { $("#confirmModal").hidden = false; });
-  $("#confirmDeleteBtn").addEventListener("click", async () => {
-    const rec = currentRec();
-    $("#confirmModal").hidden = true;
-    if (!rec) return;
-    closeLightbox();
-    await idbDelete(STORE_ITEMS, rec.id);
-    dropURLs(rec.id);
-    state.items = state.items.filter((r) => r.id !== rec.id);
-    render();
-    toast('Removed "' + rec.name + '"');
-  });
+  $("#lbCaption").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
+  $("#lbTags").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
 
-  /* Modals */
-  $("#securityBtn").addEventListener("click", () => { refreshSecurityUI(); $("#securityModal").hidden = false; });
-  document.querySelectorAll("[data-close-modal]").forEach((el) =>
-    el.addEventListener("click", () => {
-      $("#securityModal").hidden = true;
-      $("#confirmModal").hidden = true;
-      $("#passForm").hidden = true;
-    })
-  );
-
-  /* Security */
+  /* Security modal */
   $("#encToggleBtn").addEventListener("click", () => {
     const form = $("#passForm");
-    if (form.hidden) {
-      const isOn = state.cfg.encrypted;
-      $("#passFormTitle").textContent = isOn ? "Change or remove the passphrase" : "Set a vault passphrase";
-      $("#curPass").parentElement.hidden = !isOn;
-      $("#curPassLabel").textContent = "Current passphrase";
-      $("#curPass").value = "";
-      $("#newPass").value = "";
-      $("#newPass2").value = "";
+    if (state.cfg.encrypted) {
       form.hidden = false;
-      $("#newPass").focus();
+      $("#passFormTitle").textContent = "Change passphrase";
+      $("#curPassLabel").textContent = "Current passphrase";
+      $("#newPassField").hidden = false;
+      $("#newPass2Field").hidden = false;
+      $("#curPass").focus();
     } else {
-      form.hidden = true;
+      form.hidden = false;
+      $("#passFormTitle").textContent = "Set a passphrase";
+      $("#curPassLabel").textContent = "Current passphrase";
+      $("#curPass").closest(".field").hidden = true;
+      $("#newPassField").hidden = false;
+      $("#newPass2Field").hidden = false;
+      $("#newPass").focus();
     }
   });
   $("#passForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const isOn = state.cfg.encrypted;
-    const cur = $("#curPass").value;
     const p1 = $("#newPass").value;
     const p2 = $("#newPass2").value;
-    if (isOn) {
+    if (state.cfg.encrypted) {
+      const cur = $("#curPass").value;
       if (!cur) return toast("Enter your current passphrase");
       try {
         const salt = Uint8Array.from(atob(state.cfg.salt), (c) => c.charCodeAt(0));
         const key = await deriveKey(cur, salt);
-        const plain = new TextDecoder().decode(await decryptBuf(key, new Uint8Array(state.cfg.verifier.iv), state.cfg.verifier.data));
-        if (plain !== "vault-ok") throw new Error();
+        const ver = await decryptBuf(key, state.cfg.verifierIv, state.cfg.verifierCt);
+        if (dec.decode(ver) !== "vault-ok") throw new Error();
       } catch (_) {
         return toast("Current passphrase is incorrect");
       }
@@ -729,7 +976,6 @@ function wire() {
   });
 
   /* Lock */
-  $("#lockBtn").addEventListener("click", lockVault);
   $("#unlockForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const pass = $("#unlockPass").value;
@@ -742,14 +988,15 @@ function wire() {
     const lbOpen = !$("#lightbox").hidden;
     if (e.key === "/" && !typing && !lbOpen) {
       e.preventDefault();
-      $("#searchInput").focus();
+      openSearch();
       return;
     }
     if (!lbOpen) {
       if (e.key === "Escape") {
         if (typing) document.activeElement.blur();
-        $("#securityModal").hidden = true;
-        $("#confirmModal").hidden = true;
+        if (!$("#searchOverlay").hidden) closeSearch();
+        closeModal("#securityModal");
+        closeModal("#confirmModal");
         $("#passForm").hidden = true;
       }
       return;
@@ -759,7 +1006,7 @@ function wire() {
       case "ArrowRight": stepLightbox(1); break;
       case "Escape": closeLightbox(); break;
       case "f": case "F": if (!typing) toggleFavorite(); break;
-      case "Delete": case "Backspace": if (!typing) $("#confirmModal").hidden = false; break;
+      case "Delete": case "Backspace": if (!typing) openModal("#confirmModal"); break;
     }
   });
 
@@ -776,17 +1023,10 @@ function wire() {
   );
   resetLock();
 
-  wireTilt();
-}
-
-function refreshSecurityUI() {
-  const isOn = state.cfg.encrypted;
-  const btn = $("#encToggleBtn");
-  btn.textContent = isOn ? "Manage" : "Enable";
-  btn.className = "btn " + (isOn ? "btn-ghost" : "btn-gold");
-  $("#secStatus").textContent = isOn
-    ? "On — AES-256-GCM, key in memory only"
-    : "Off — images stored locally, unencrypted";
+  /* clicking outside the search overlay closes it */
+  $("#stage").addEventListener("pointerdown", () => {
+    if (!$("#searchOverlay").hidden) closeSearch();
+  });
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
@@ -798,6 +1038,7 @@ function refreshSecurityUI() {
     console.error(err);
   }
   if (state.cfg.encrypted) {
+    $("#orbLock").hidden = false;
     await lockVault();
   } else {
     state.locked = false;
@@ -810,3 +1051,4 @@ function refreshSecurityUI() {
     render();
   }
 })();
+

@@ -6,14 +6,18 @@ your own device and never leaves it.
 
 ## Features
 
-- **Upload anything** — click, drag & drop anywhere on the page, or paste
-  straight from the clipboard. Multiple files at once.
-- **Masonry archive** — a quiet, dark, museum-style grid with staggered
-  entrances, hover captions and favorite markers.
+- **Upload anything** — add via the menu, drag & drop anywhere on the page, or
+  paste straight from the clipboard. Multiple files at once.
+- **A 3D world** — your images hang as planes in a quiet void: drag to orbit,
+  scroll to move, hover to lift a plane, click to open it. New arrivals scale
+  in with a stagger; favorites get a thin steel edge.
 - **Full viewer** — lightbox with keyboard navigation (`←` `→` `Esc`),
   favorites (`F`), delete (`Del`), editable captions and tags, download.
-- **Search & sort** — instant search across names, captions and tags;
-  sort by newest, oldest, name or favorites. Press `/` to jump to search.
+- **Search & sort** — instant search across names, captions and tags
+  (non-matches fade into the dark); sort by newest, oldest, name or
+  favorites. Press `/` to jump to search.
+- **One button** — a single orbital menu fans out into Add, Search, Sort,
+  Security and Lock. Almost no UI until you ask for it.
 - **Optional vault encryption** — set a passphrase and every image, thumbnail,
   caption and tag is encrypted with **AES-256-GCM** before it touches storage.
   The key is derived with **PBKDF2 (600,000 iterations)** and exists only in
@@ -35,8 +39,9 @@ backup.
 
 ## Tech
 
-Vanilla HTML/CSS/JS, no build step, no dependencies, no tracking. Served as a
-static site. Type: Instrument Serif + Satoshi.
+Vanilla HTML/CSS/JS modules, no build step, no tracking. The 3D world runs on
+three.js (loaded from CDN). Type: Instrument Serif + Satoshi. Served as a
+static site.
 
 ## Run locally
 
